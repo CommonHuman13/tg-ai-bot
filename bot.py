@@ -2,479 +2,555 @@ import os
 import re
 import json
 import time
+import heapq
 import asyncio
 import logging
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from collections import defaultdict, deque
-from typing import Optional, Tuple, Dict, Deque, Any, List
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
-from aiogram.filters import CommandStart, Command
-
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from collections import defaultdict, deque
+from typing import Optional, List, Tuple
 
-import aiosqlite
+import dateparser
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.exceptions import TelegramBadRequest
+
+from aiohttp import web
+
 from google import genai
+from google.genai import types
+from google.genai.errors import ClientError
 
 
-# ======================
-# Config
-# ======================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-
-# Важно: Render чаще всего в UTC. Поставь Europe/Moscow или свой.
-BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Moscow")
-TZ = ZoneInfo(BOT_TIMEZONE)
-
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-
-MAX_TURNS = int(os.getenv("MAX_TURNS", "24"))          # сколько “реплик” (user+assistant) хранить
-MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "12000"))  # чтобы не улетать в лимиты
-MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "4000"))     # лимит Telegram на одно сообщение
-
-# Антифлуд (на пользователя)
-USER_COOLDOWN_SEC = float(os.getenv("USER_COOLDOWN_SEC", "1.2"))
-
-# SQLite файл (на Render без диска может сбрасываться при redeploy — это нормально для free)
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    "Ты полезный ассистент в Telegram. Отвечай кратко, по делу, дружелюбно. "
-    "Если пользователь просит напоминание, помогай сформулировать и подтверждай."
-)
-
+# =========================
+# CONFIG
+# =========================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("tg-ai-bot")
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
 
-# ======================
-# Helpers: memory
-# ======================
-HistoryItem = Dict[str, str]  # {"role": "user"/"assistant", "content": "..."}
+# Gemini ключ лучше хранить в GEMINI_API_KEY, но поддержим и старые названия:
+GEMINI_API_KEY = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("GOOGLE_API_KEY")
+    or os.getenv("OPENAI_API_KEY")
+    or ""
+).strip()
+if not GEMINI_API_KEY:
+    raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY / OPENAI_API_KEY) env var")
 
-history: Dict[int, Deque[HistoryItem]] = defaultdict(lambda: deque(maxlen=MAX_TURNS * 2))
-chat_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+# Модель: ставим стабильный дефолт. Пример использования есть в официальных доках. :contentReference[oaicite:4]{index=4}
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 
-# антифлуд
-last_user_call: Dict[int, float] = {}
+# Если ловил 404 на v1beta — используй v1 (через HttpOptions). :contentReference[oaicite:5]{index=5}
+GEMINI_API_VERSION = os.getenv("GEMINI_API_VERSION", "v1").strip()
+
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow").strip()
+TZ = ZoneInfo(TIMEZONE)
+
+SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "Ты полезный, дружелюбный ассистент в Telegram. Отвечай кратко и по делу, если не просят иначе.",
+).strip()
+
+# История (сколько последних «сообщений» хранить на чат)
+MAX_TURNS = int(os.getenv("MAX_TURNS", "12"))  # 12 пар = 24 сообщений
+HISTORY_MAXLEN = MAX_TURNS * 2
+
+# Антиспам/нагрузка
+COOLDOWN_SEC = float(os.getenv("COOLDOWN_SEC", "1.2"))  # минимальная пауза между запросами от одного юзера
+MODEL_TIMEOUT_SEC = float(os.getenv("MODEL_TIMEOUT_SEC", "40"))
+
+# Ответ Telegram ограничен ~4096
+TG_LIMIT = 3900
+
+# Напоминания: файл (частичная «живучесть» при рестарте)
+REMINDERS_FILE = os.getenv("REMINDERS_FILE", "reminders.json").strip()
+
+# Если хочешь, чтобы бот отвечал только тебе: поставь свой user_id (можно узнать командой /myid)
+ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID", "").strip()
+ALLOWED_USER_ID_INT = int(ALLOWED_USER_ID) if ALLOWED_USER_ID.isdigit() else None
 
 
-def build_prompt(chat_id: int) -> str:
-    """
-    Собираем историю в один prompt (Gemini принимает plain text).
-    """
-    lines: List[str] = [SYSTEM_PROMPT, ""]
-    for item in history[chat_id]:
-        role = "Пользователь" if item["role"] == "user" else "Ассистент"
-        lines.append(f"{role}: {item['content']}")
-    lines.append("Ассистент:")
-    prompt = "\n".join(lines)
-
-    # подрезаем, если слишком большой
-    if len(prompt) > MAX_PROMPT_CHARS:
-        # режем старые сообщения, пока не влезем
-        while len(prompt) > MAX_PROMPT_CHARS and len(history[chat_id]) > 2:
-            history[chat_id].popleft()
-            prompt = "\n".join([SYSTEM_PROMPT, ""] + [
-                f"{'Пользователь' if i['role']=='user' else 'Ассистент'}: {i['content']}"
-                for i in history[chat_id]
-            ] + ["Ассистент:"])
-    return prompt
+# =========================
+# GEMINI CLIENT
+# =========================
+client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(api_version=GEMINI_API_VERSION),
+)
 
 
-def split_text(s: str, chunk: int = MAX_REPLY_CHARS) -> List[str]:
-    s = (s or "").strip()
-    if not s:
+# =========================
+# STATE
+# =========================
+# chat_id -> deque[{"role": "user"|"model", "text": "..."}]
+history = defaultdict(lambda: deque(maxlen=HISTORY_MAXLEN))
+
+# user_id -> last_ts
+last_request_ts = defaultdict(lambda: 0.0)
+
+# chat_id -> lock (чтобы не было гонок, если юзер спамит сообщениями)
+chat_locks = defaultdict(asyncio.Lock)
+
+
+# =========================
+# REMINDERS
+# =========================
+@dataclass
+class Reminder:
+    rid: str
+    chat_id: int
+    user_id: int
+    when_ts: float  # unix timestamp
+    text: str
+
+# min-heap by when_ts
+reminder_heap: List[Tuple[float, str]] = []  # (when_ts, rid)
+reminders: dict[str, Reminder] = {}
+
+
+def _now_ts() -> float:
+    return time.time()
+
+
+def _dt_to_ts(dt: datetime) -> float:
+    return dt.timestamp()
+
+
+def _ts_to_dt(ts: float) -> datetime:
+    return datetime.fromtimestamp(ts, TZ)
+
+
+def save_reminders() -> None:
+    try:
+        payload = [asdict(r) for r in reminders.values()]
+        with open(REMINDERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        log.exception("Failed to save reminders")
+
+
+def load_reminders() -> None:
+    if not os.path.exists(REMINDERS_FILE):
+        return
+    try:
+        with open(REMINDERS_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        for item in payload:
+            r = Reminder(**item)
+            reminders[r.rid] = r
+            heapq.heappush(reminder_heap, (r.when_ts, r.rid))
+        log.info("Loaded reminders: %d", len(reminders))
+    except Exception:
+        log.exception("Failed to load reminders")
+
+
+def gen_rid() -> str:
+    # достаточно для одного процесса
+    return f"r{int(_now_ts()*1000)}_{os.getpid()}"
+
+
+def split_text(text: str, limit: int = TG_LIMIT) -> List[str]:
+    text = text.strip()
+    if not text:
         return ["(пустой ответ)"]
     parts = []
-    while len(s) > chunk:
-        parts.append(s[:chunk])
-        s = s[chunk:]
-    parts.append(s)
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < 200:
+            cut = limit
+        parts.append(text[:cut].strip())
+        text = text[cut:].strip()
+    parts.append(text)
     return parts
 
 
-# ======================
-# Helpers: reminders
-# ======================
-@dataclass
-class Reminder:
-    id: int
-    chat_id: int
-    due_utc: int  # unix seconds UTC
-    text: str
-    created_utc: int
+def is_time_explicit(s: str) -> bool:
+    # грубо: "в 12", "12:30", "19.45"
+    return bool(re.search(r"\b\d{1,2}([:.]\d{2})?\b", s))
 
 
-class ReminderStore:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._inited = False
-
-    async def init(self):
-        if self._inited:
-            return
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS reminders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id INTEGER NOT NULL,
-                    due_utc INTEGER NOT NULL,
-                    text TEXT NOT NULL,
-                    created_utc INTEGER NOT NULL
-                )
-            """)
-            await db.commit()
-        self._inited = True
-
-    async def add(self, chat_id: int, due_utc: int, text: str) -> int:
-        await self.init()
-        created = int(time.time())
-        async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute(
-                "INSERT INTO reminders(chat_id, due_utc, text, created_utc) VALUES (?, ?, ?, ?)",
-                (chat_id, due_utc, text, created)
-            )
-            await db.commit()
-            return int(cur.lastrowid)
-
-    async def delete(self, reminder_id: int, chat_id: int) -> bool:
-        await self.init()
-        async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute(
-                "DELETE FROM reminders WHERE id = ? AND chat_id = ?",
-                (reminder_id, chat_id)
-            )
-            await db.commit()
-            return cur.rowcount > 0
-
-    async def list_for_chat(self, chat_id: int) -> List[Reminder]:
-        await self.init()
-        async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute(
-                "SELECT id, chat_id, due_utc, text, created_utc FROM reminders WHERE chat_id = ? ORDER BY due_utc ASC",
-                (chat_id,)
-            )
-            rows = await cur.fetchall()
-        return [Reminder(*row) for row in rows]
-
-    async def due_after_now(self) -> List[Reminder]:
-        await self.init()
-        now = int(time.time())
-        async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute(
-                "SELECT id, chat_id, due_utc, text, created_utc FROM reminders WHERE due_utc >= ? ORDER BY due_utc ASC",
-                (now,)
-            )
-            rows = await cur.fetchall()
-        return [Reminder(*row) for row in rows]
-
-
-store = ReminderStore(DB_PATH)
-scheduled_tasks: Dict[int, asyncio.Task] = {}  # reminder_id -> task
-
-
-def parse_reminder_ru(text: str, now_local: datetime) -> Optional[Tuple[datetime, str]]:
+def parse_reminder(text: str) -> Optional[Tuple[datetime, str]]:
     """
-    Простейший разбор русских фраз:
+    Понимает фразы типа:
     - "напомни завтра распечатать документы"
-    - "напомни завтра в 10:30 распечатать документы"
-    - "напомни через 15 минут выпить воды"
-    - "напомни через 2 часа позвонить"
-    Возвращает (due_local_datetime, reminder_text)
+    - "напомни мне завтра в 18:30 позвонить маме"
+    - "напомни через 2 часа проверить почту"
     """
-
     t = text.strip()
 
-    # вытащим "напомни мне" / "напомни"
-    m = re.match(r"(?i)^\s*напомни(?:\s+мне)?\s+(.*)$", t)
-    if not m:
+    if not re.search(r"^\s*напомни", t, flags=re.IGNORECASE):
         return None
 
-    rest = m.group(1).strip()
+    # пытаемся вытащить дату/время из всей строки
+    settings = {
+        "TIMEZONE": TIMEZONE,
+        "RETURN_AS_TIMEZONE_AWARE": True,
+        "PREFER_DATES_FROM": "future",
+        "RELATIVE_BASE": datetime.now(TZ),
+    }
 
-    # через N минут/часов/дней
-    m2 = re.match(r"(?i)^через\s+(\d+)\s*(минут|мин|минуты|минута|час|часа|часов|день|дня|дней)\s+(.*)$", rest)
-    if m2:
-        n = int(m2.group(1))
-        unit = m2.group(2).lower()
-        msg = m2.group(3).strip()
-        delta = None
-        if "мин" in unit:
-            delta = timedelta(minutes=n)
-        elif "час" in unit:
-            delta = timedelta(hours=n)
-        elif "ден" in unit or "дн" in unit:
-            delta = timedelta(days=n)
+    # dateparser хорошо понимает RU
+    # 1) попробуем найти datetime в строке после "напомни"
+    after = re.sub(r"^\s*напомни(\s+мне)?\s*", "", t, flags=re.IGNORECASE).strip()
+    if not after:
+        return None
 
-        if delta is None or not msg:
+    # эвристика: разделим "когда" и "что" — по первому глаголу/тексту может не сработать,
+    # поэтому: сначала парсим datetime прямо из after.
+    dt = dateparser.parse(after, languages=["ru"], settings=settings)
+
+    # Если dt не получился — попробуем парсить первые 60 символов как "когда"
+    if dt is None:
+        dt = dateparser.parse(after[:60], languages=["ru"], settings=settings)
+        if dt is None:
             return None
 
-        return (now_local + delta, msg)
+    # Если время не указано явно — поставим дефолт 10:00
+    if not is_time_explicit(after):
+        dt = dt.replace(hour=10, minute=0, second=0, microsecond=0)
 
-    # завтра/сегодня/послезавтра (+ время)
-    day_shift = None
-    if re.search(r"(?i)\bпослезавтра\b", rest):
-        day_shift = 2
-        rest = re.sub(r"(?i)\bпослезавтра\b", "", rest).strip()
-    elif re.search(r"(?i)\bзавтра\b", rest):
-        day_shift = 1
-        rest = re.sub(r"(?i)\bзавтра\b", "", rest).strip()
-    elif re.search(r"(?i)\bсегодня\b", rest):
-        day_shift = 0
-        rest = re.sub(r"(?i)\bсегодня\b", "", rest).strip()
+    # Что напомнить: пытаемся убрать «датовую» часть простым способом:
+    # если пользователь писал "завтра ...", "через ...", "в 19:00 ..." — часто это в начале.
+    # Берём "что" как текст после найденной даты (эвристика по ключевым словам).
+    what = after
 
-    if day_shift is not None:
-        # время: "в 10:30" или "в 10"
-        time_h, time_m = 10, 0  # дефолт: 10:00
-        mt = re.search(r"(?i)\bв\s*(\d{1,2})(?::(\d{2}))?\b", rest)
-        if mt:
-            time_h = int(mt.group(1))
-            time_m = int(mt.group(2) or "0")
-            rest = re.sub(r"(?i)\bв\s*\d{1,2}(?::\d{2})?\b", "", rest).strip()
+    # убираем частые маркеры времени в начале
+    what = re.sub(r"^(завтра|послезавтра|сегодня)\b", "", what, flags=re.IGNORECASE).strip()
+    what = re.sub(r"^через\s+\d+\s*(минут|мин|час|часа|часов|день|дня|дней)\b", "", what, flags=re.IGNORECASE).strip()
+    what = re.sub(r"^в\s+\d{1,2}([:.]\d{2})?\b", "", what, flags=re.IGNORECASE).strip()
 
-        msg = rest.strip(" ,.-")
-        if not msg:
-            msg = "напоминание"
+    # если так и осталось пусто — попросим уточнить
+    if not what:
+        what = "Напоминание"
 
-        due = (now_local + timedelta(days=day_shift)).replace(
-            hour=time_h, minute=time_m, second=0, microsecond=0
-        )
-        # если “сегодня” и время уже прошло — сдвинем на +1 час, чтобы не было “в прошлом”
-        if due <= now_local:
-            due = now_local + timedelta(hours=1)
-            due = due.replace(second=0, microsecond=0)
-
-        return due, msg
-
-    return None
+    return dt, what
 
 
-async def schedule_reminder(bot: Bot, rem: Reminder):
-    """
-    Ждём до времени и отправляем сообщение.
-    """
-    now = int(time.time())
-    wait_sec = max(0, rem.due_utc - now)
-
-    async def runner():
+async def reminder_loop(bot: Bot) -> None:
+    while True:
         try:
-            await asyncio.sleep(wait_sec)
-            await bot.send_message(rem.chat_id, f"⏰ Напоминание: {rem.text}")
-        finally:
-            # чистим из БД и из задач
-            try:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("DELETE FROM reminders WHERE id = ?", (rem.id,))
-                    await db.commit()
-            except Exception:
-                log.exception("Failed to delete reminder from DB")
-            scheduled_tasks.pop(rem.id, None)
+            if not reminder_heap:
+                await asyncio.sleep(1.0)
+                continue
 
-    task = asyncio.create_task(runner())
-    scheduled_tasks[rem.id] = task
+            when_ts, rid = reminder_heap[0]
+            now = _now_ts()
+
+            if when_ts > now:
+                await asyncio.sleep(min(30.0, when_ts - now))
+                continue
+
+            heapq.heappop(reminder_heap)
+            r = reminders.pop(rid, None)
+            save_reminders()
+            if not r:
+                continue
+
+            dt = _ts_to_dt(r.when_ts).strftime("%d.%m.%Y %H:%M")
+            await bot.send_message(r.chat_id, f"⏰ Напоминание ({dt}): {r.text}")
+
+        except Exception:
+            log.exception("Reminder loop error")
+            await asyncio.sleep(2.0)
 
 
-async def restore_scheduled(bot: Bot):
+# =========================
+# HEALTH SERVER (для Render Web Service)
+# =========================
+async def start_health_server() -> None:
     """
-    При старте поднимаем напоминания из БД и планируем снова.
+    Если деплоишь как Render Web Service, он ожидает, что процесс откроет порт ($PORT),
+    иначе пишет "No open ports detected...".
+    Делаем крошечный HTTP сервер.
     """
-    reminders = await store.due_after_now()
-    for rem in reminders:
-        if rem.id not in scheduled_tasks:
-            await schedule_reminder(bot, rem)
+    port = os.getenv("PORT")
+    if not port:
+        return
+    port_i = int(port)
+
+    app = web.Application()
+
+    async def health(_):
+        return web.json_response({"ok": True})
+
+    app.router.add_get("/", health)
+    app.router.add_get("/healthz", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port_i)
+    await site.start()
+    log.info("Health server started on :%d", port_i)
 
 
-# ======================
-# Gemini call (без блокировки event loop)
-# ======================
-def _gemini_generate_sync(prompt: str) -> str:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
-    txt = getattr(resp, "text", None) or ""
-    return txt.strip()
+# =========================
+# AI CALL
+# =========================
+def build_contents(chat_id: int, user_text: str) -> List[types.Content]:
+    contents: List[types.Content] = []
+
+    for m in history[chat_id]:
+        role = "user" if m["role"] == "user" else "model"
+        contents.append(types.Content(role=role, parts=[types.Part.from_text(m["text"])]))
+
+    contents.append(types.Content(role="user", parts=[types.Part.from_text(user_text)]))
+    return contents
 
 
-async def gemini_generate(prompt: str, retries: int = 3) -> str:
-    delay = 1.0
-    for attempt in range(1, retries + 1):
+async def call_gemini(chat_id: int, user_text: str) -> str:
+    contents = build_contents(chat_id, user_text)
+
+    config = types.GenerateContentConfig(
+        system_instruction=[SYSTEM_PROMPT],
+        temperature=0.6,
+        max_output_tokens=1024,
+    )
+
+    # 1) пробуем выбранную модель
+    try_models = [GEMINI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash-001"]
+
+    last_err = None
+    for model_name in try_models:
         try:
-            return await asyncio.to_thread(_gemini_generate_sync, prompt)
+            resp = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                ),
+                timeout=MODEL_TIMEOUT_SEC,
+            )
+            # Обычно есть resp.text
+            text = getattr(resp, "text", None)
+            if not text:
+                # fallback: попытка достать вручную
+                try:
+                    text = resp.candidates[0].content.parts[0].text
+                except Exception:
+                    text = ""
+            text = (text or "").strip()
+            if text:
+                return text
+            return "Пустой ответ от модели. Попробуй переформулировать."
+
+        except ClientError as e:
+            last_err = e
+            # 404 по модели — пробуем следующий вариант
+            log.warning("Model failed (%s): %s", model_name, str(e))
+            continue
+        except asyncio.TimeoutError as e:
+            last_err = e
+            log.warning("Model timeout (%s)", model_name)
+            continue
         except Exception as e:
-            log.warning("Gemini error attempt %s/%s: %s", attempt, retries, e)
-            if attempt == retries:
-                raise
-            await asyncio.sleep(delay)
-            delay *= 2
-    return ""
+            last_err = e
+            log.exception("Model error (%s)", model_name)
+            continue
+
+    return f"Не смог получить ответ от модели 😕 (ошибка: {last_err})"
 
 
-# ======================
-# Bot handlers
-# ======================
+# =========================
+# TELEGRAM BOT
+# =========================
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+dp = Dispatcher()
+
+
+def allowed(message: Message) -> bool:
+    if ALLOWED_USER_ID_INT is None:
+        return True
+    return message.from_user and message.from_user.id == ALLOWED_USER_ID_INT
+
+
+@dp.message(Command("start"))
 async def cmd_start(message: Message):
+    if not allowed(message):
+        return
     await message.answer(
         "Привет! Напиши сообщение — отвечу как ИИ 🙂\n"
         "Команды:\n"
         "• /reset — сбросить контекст\n"
-        "• /remind <текст> — поставить напоминание\n"
-        "• /reminders — список напоминаний\n"
-        "• /cancel <id> — отменить напоминание\n\n"
-        "Можно и без команд: напиши, например:\n"
-        "«напомни мне завтра в 10:30 распечатать документы»"
+        "• /myid — показать твой user_id\n"
+        "• /remind <когда> <что> — напоминание (или просто: «напомни завтра …»)\n"
+        "• /reminds — список напоминаний\n"
+        "• /delremind <id> — удалить напоминание"
     )
 
 
+@dp.message(Command("myid"))
+async def cmd_myid(message: Message):
+    if not allowed(message):
+        return
+    uid = message.from_user.id if message.from_user else "unknown"
+    await message.answer(f"Твой user_id: <code>{uid}</code>")
+
+
+@dp.message(Command("reset"))
 async def cmd_reset(message: Message):
+    if not allowed(message):
+        return
     history[message.chat.id].clear()
     await message.answer("Ок, сбросил контекст. Пиши заново 🙂")
 
 
-async def cmd_reminders(message: Message):
-    items = await store.list_for_chat(message.chat.id)
-    if not items:
-        await message.answer("Напоминаний нет.")
+@dp.message(Command("reminds"))
+async def cmd_reminds(message: Message):
+    if not allowed(message):
+        return
+    uid = message.from_user.id if message.from_user else 0
+    user_items = [r for r in reminders.values() if r.user_id == uid and r.chat_id == message.chat.id]
+    if not user_items:
+        await message.answer("У тебя нет активных напоминаний.")
         return
 
-    lines = ["📌 Твои напоминания:"]
-    for r in items:
-        dt_local = datetime.fromtimestamp(r.due_utc, tz=timezone.utc).astimezone(TZ)
-        lines.append(f"• id={r.id} — {dt_local:%Y-%m-%d %H:%M} — {r.text}")
-    await message.answer("\n".join(lines))
+    lines = []
+    for r in sorted(user_items, key=lambda x: x.when_ts):
+        dt = _ts_to_dt(r.when_ts).strftime("%d.%m %H:%M")
+        lines.append(f"• <code>{r.rid}</code> — {dt} — {r.text}")
+    await message.answer("Твои напоминания:\n" + "\n".join(lines))
 
 
-async def cmd_cancel(message: Message):
-    # /cancel 123
-    parts = (message.text or "").split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Формат: /cancel <id>")
+@dp.message(Command("delremind"))
+async def cmd_delremind(message: Message):
+    if not allowed(message):
         return
-    rid = int(parts[1])
-
-    ok = await store.delete(rid, message.chat.id)
-    task = scheduled_tasks.pop(rid, None)
-    if task:
-        task.cancel()
-
-    await message.answer("✅ Отменил." if ok else "Не нашёл такое напоминание.")
-
-
-async def handle_remind_text(message: Message, text: str):
-    now_local = datetime.now(TZ)
-    parsed = parse_reminder_ru(text, now_local)
-    if not parsed:
-        await message.answer(
-            "Не понял время 😅\n"
-            "Примеры:\n"
-            "• напомни завтра в 10:30 распечатать документы\n"
-            "• напомни через 15 минут размяться\n"
-            "• /remind завтра 18:00 позвонить"
-        )
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /delremind <id>")
+        return
+    rid = parts[1].strip()
+    r = reminders.get(rid)
+    if not r:
+        await message.answer("Не нашёл такое напоминание.")
+        return
+    if message.from_user and r.user_id != message.from_user.id:
+        await message.answer("Это не твоё напоминание 🙂")
         return
 
-    due_local, msg = parsed
-    due_utc = int(due_local.astimezone(timezone.utc).timestamp())
-
-    rid = await store.add(message.chat.id, due_utc, msg)
-    rem = Reminder(id=rid, chat_id=message.chat.id, due_utc=due_utc, text=msg, created_utc=int(time.time()))
-    await schedule_reminder(message.bot, rem)
-
-    await message.answer(f"✅ Ок! Напомню {due_local:%Y-%m-%d %H:%M}: {msg}")
+    reminders.pop(rid, None)
+    # heap чистить лениво не будем — loop сам пропустит отсутствующий rid
+    save_reminders()
+    await message.answer("Удалил ✅")
 
 
+@dp.message(Command("remind"))
 async def cmd_remind(message: Message):
-    # /remind <что-то>
-    txt = (message.text or "")
-    rest = txt[len("/remind"):].strip()
-    if not rest:
-        await message.answer("Напиши так: /remind завтра в 10:30 распечатать документы")
+    if not allowed(message):
         return
-    # поддержим “/remind завтра 10:30 …” без слова “в”
-    # превратим в форму “напомни …”
-    fake = "напомни " + rest
-    await handle_remind_text(message, fake)
+    text = (message.text or "").strip()
+    arg = text.split(maxsplit=1)
+    if len(arg) < 2:
+        await message.answer("Пример: /remind завтра в 18:30 распечатать документы")
+        return
+
+    parsed = parse_reminder("напомни " + arg[1])
+    if not parsed:
+        await message.answer("Не понял когда напомнить. Пример: /remind завтра в 18:30 распечатать документы")
+        return
+
+    dt, what = parsed
+    rid = gen_rid()
+    r = Reminder(
+        rid=rid,
+        chat_id=message.chat.id,
+        user_id=message.from_user.id if message.from_user else 0,
+        when_ts=_dt_to_ts(dt),
+        text=what,
+    )
+    reminders[rid] = r
+    heapq.heappush(reminder_heap, (r.when_ts, rid))
+    save_reminders()
+
+    await message.answer(f"Ок! Поставил напоминание ✅\nID: <code>{rid}</code>\nКогда: {_ts_to_dt(r.when_ts).strftime('%d.%m.%Y %H:%M')}\nЧто: {what}")
 
 
-async def chat(message: Message):
-    # Игнорим пустые/не текстовые
+@dp.message(F.text)
+async def on_text(message: Message):
+    if not allowed(message):
+        return
+
+    uid = message.from_user.id if message.from_user else 0
+    now = _now_ts()
+    if now - last_request_ts[uid] < COOLDOWN_SEC:
+        return
+    last_request_ts[uid] = now
+
     text = (message.text or "").strip()
     if not text:
         return
 
-    # 1) если это “напомни …” — делаем напоминание
-    if re.match(r"(?i)^\s*напомни", text):
-        await handle_remind_text(message, text)
+    # 1) Натуральные напоминания без команды
+    parsed = parse_reminder(text)
+    if parsed:
+        dt, what = parsed
+        rid = gen_rid()
+        r = Reminder(
+            rid=rid,
+            chat_id=message.chat.id,
+            user_id=uid,
+            when_ts=_dt_to_ts(dt),
+            text=what,
+        )
+        reminders[rid] = r
+        heapq.heappush(reminder_heap, (r.when_ts, rid))
+        save_reminders()
+
+        await message.answer(
+            f"Ок! Напомню ✅\nID: <code>{rid}</code>\n"
+            f"Когда: {_ts_to_dt(r.when_ts).strftime('%d.%m.%Y %H:%M')}\n"
+            f"Что: {what}"
+        )
         return
 
-    # 2) антифлуд на пользователя
-    uid = message.from_user.id if message.from_user else 0
-    now = time.time()
-    prev = last_user_call.get(uid, 0.0)
-    if now - prev < USER_COOLDOWN_SEC:
-        await message.answer("Секунду 🙂")
-        return
-    last_user_call[uid] = now
-
-    chat_id = message.chat.id
-
-    # 3) блокируем чат, чтобы не было гонок (2 запроса одновременно)
-    async with chat_locks[chat_id]:
-        # добавляем user в память
-        history[chat_id].append({"role": "user", "content": text})
-
-        thinking = await message.answer("Думаю…")
+    # 2) AI ответ
+    async with chat_locks[message.chat.id]:
+        thinking = await message.answer("🤔 Думаю...")
 
         try:
-            prompt = build_prompt(chat_id)
-            answer = await gemini_generate(prompt)
+            answer = await call_gemini(message.chat.id, text)
+
+            # обновляем историю только после успешного ответа
+            history[message.chat.id].append({"role": "user", "text": text})
+            history[message.chat.id].append({"role": "model", "text": answer})
+
+            parts = split_text(answer)
+            # первая часть — редактируем "Думаю..."
+            try:
+                await thinking.edit_text(parts[0])
+            except TelegramBadRequest:
+                # если нельзя отредактировать — просто отправим
+                await thinking.delete()
+                await message.answer(parts[0])
+
+            # остальные части — отдельными сообщениями
+            for p in parts[1:]:
+                await message.answer(p)
+
         except Exception:
-            log.exception("Failed to generate")
-            # откатим последнее сообщение пользователя, чтобы не ломать память мусором
-            if history[chat_id] and history[chat_id][-1]["role"] == "user":
-                history[chat_id].pop()
-            await thinking.edit_text("Ошибка при обращении к модели. Попробуй ещё раз позже 🙏")
-            return
-
-        if not answer:
-            answer = "Похоже, я не получил ответ. Попробуй переформулировать."
-
-        # добавляем assistant в память
-        history[chat_id].append({"role": "assistant", "content": answer})
-
-        parts = split_text(answer, MAX_REPLY_CHARS)
-        await thinking.edit_text(parts[0])
-        for p in parts[1:]:
-            await message.answer(p)
+            log.exception("Handler error")
+            try:
+                await thinking.edit_text("Сорян, что-то сломалось 😕 Попробуй ещё раз.")
+            except Exception:
+                pass
 
 
 async def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is missing")
+    load_reminders()
+    asyncio.create_task(reminder_loop(bot))
+    asyncio.create_task(start_health_server())
 
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    dp = Dispatcher()
-
-    dp.message.register(cmd_start, CommandStart())
-    dp.message.register(cmd_reset, Command("reset"))
-    dp.message.register(cmd_remind, Command("remind"))
-    dp.message.register(cmd_reminders, Command("reminders"))
-    dp.message.register(cmd_cancel, Command("cancel"))
-
-    dp.message.register(chat, F.text)
-
-    await store.init()
-    await restore_scheduled(bot)
-
-    log.info("Bot started. TZ=%s model=%s", BOT_TIMEZONE, MODEL_NAME)
+    log.info("Bot starting... model=%s api_version=%s tz=%s", GEMINI_MODEL, GEMINI_API_VERSION, TIMEZONE)
     await dp.start_polling(bot)
 
 
