@@ -1,9 +1,10 @@
 import os
 import asyncio
 import logging
+import re
 from collections import defaultdict, deque
 from typing import Deque, Tuple
-
+from google.genai import types
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -57,11 +58,7 @@ history: defaultdict[int, History] = defaultdict(lambda: deque(maxlen=MAX_TURNS 
 
 
 def build_prompt(chat_id: int, user_text: str) -> str:
-    """
-    Надежный способ без types.Part / roles:
-    Склеиваем историю в один текстовый prompt.
-    """
-    lines = [SYSTEM_PROMPT, "", "Диалог:"]
+    lines = ["Ты ассистент в Telegram. Отвечай кратко и по делу.", ""]
     for role, text in history[chat_id]:
         lines.append(f"{role}: {text}")
     lines.append(f"User: {user_text}")
@@ -69,26 +66,43 @@ def build_prompt(chat_id: int, user_text: str) -> str:
     return "\n".join(lines)
 
 
+
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "512"))
+GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.6"))
+
+def _is_quota_error(e: Exception) -> bool:
+    s = str(e)
+    return ("RESOURCE_EXHAUSTED" in s) or ("quota" in s.lower()) or ("429" in s)
+
 async def call_gemini(chat_id: int, user_text: str) -> str:
     prompt = build_prompt(chat_id, user_text)
 
     def _sync_call() -> str:
         resp = client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=prompt,  # официальный пример допускает строку contents :contentReference[oaicite:1]{index=1}
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=GEMINI_TEMPERATURE,
+                max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+            ),
         )
-        # resp.text обычно уже готов
         txt = getattr(resp, "text", None)
         return (txt or "").strip()
 
     try:
-        text = await asyncio.to_thread(_sync_call)
-        if not text:
-            return "Пустой ответ от модели. Попробуй переформулировать вопрос."
-        return text
+        return await asyncio.to_thread(_sync_call)
     except Exception as e:
+        if _is_quota_error(e):
+            return (
+                "⚠️ Уперлись в лимит Gemini (квота Free tier закончилась или слишком много запросов).\n"
+                "Попробуй:\n"
+                "• подождать 5–30 минут и повторить\n"
+                "• либо завтра (если дневная квота)\n"
+                "• либо включить Billing/другой ключ\n"
+                "• либо уменьшить MAX_TURNS/макс. токены ответа."
+            )
         log.exception("Gemini error: %s", e)
-        return "Упс, модель не ответила из-за ошибки. Попробуй ещё раз через пару секунд."
+        return "Упс, ошибка при запросе к модели. Попробуй ещё раз."
 
 
 async def send_long(message: Message, text: str) -> None:
@@ -173,4 +187,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
